@@ -23,6 +23,11 @@
     status_ = err;      \
     return Result::ERR;
 
+// The generic HAL_QPSI_TIMEOUT_DEFAULT_VALUE (5s) is excessive for waiting on
+// the status register's own non-volatile write: the datasheet spec is ~2-15ms
+// and even badly worn chips have been seen completing in ~1040ms.
+static constexpr uint32_t kStatusRegWriteTimeoutMs = 2000;
+
 
 namespace daisy
 {
@@ -116,7 +121,7 @@ class QSPIHandle::Impl
     // These functions are defined, but we haven't added the ability to switch to quad mode. So they're currently unused.
     QSPIHandle::Result EnterQuadMode() __attribute__((unused));
     QSPIHandle::Result ExitQuadMode() __attribute__((unused));
-    uint8_t            GetStatusRegister() __attribute__((unused));
+    uint8_t            GetStatusRegister();
 
     QSPIHandle::Config config_;
     QSPI_HandleTypeDef halqspi_;
@@ -189,10 +194,10 @@ QSPIHandle::Result QSPIHandle::Impl::PreInit(uint32_t flash_size)
     {
         ERR_SIMPLE(Status::E_HAL_ERROR);
     }
-    if(DefaultStatusRegister() != QSPIHandle::Result::OK)
-    {
-        ERR_SIMPLE(Status::E_HAL_ERROR);
-    }
+    // Not fatal: on a worn chip whose status register write no longer
+    // completes, aborting here would skip the DeInit/pin cleanup below and leave
+    // the QSPI peripheral half-configured, hanging every later step too.
+    DefaultStatusRegister();
     if(HAL_QSPI_DeInit(&halqspi_) != HAL_OK)
     {
         ERR_SIMPLE(Status::E_HAL_ERROR);
@@ -268,10 +273,8 @@ QSPIHandle::Result QSPIHandle::Impl::Init(const QSPIHandle::Config& config)
     }
     // Once writing test with 1 Line is confirmed lets move this out, and update writing to use 4-line.
     // This should be redundant, but just in case we want to ensure that the QE is set.
-    if(QuadEnable() != QSPIHandle::Result::OK)
-    {
-        ERR_SIMPLE(Status::E_HAL_ERROR);
-    }
+    // Not fatal, for the same reason as DefaultStatusRegister() in PreInit()
+    QuadEnable();
 
     if(mode == Config::Mode::MEMORY_MAPPED)
     {
@@ -734,6 +737,14 @@ QSPIHandle::Result QSPIHandle::Impl::QuadEnable()
     QSPI_AutoPollingTypeDef s_config;
     uint8_t                 reg = 0;
 
+    // The status register is non-volatile, with the same finite write
+    // endurance as the flash array. Rewriting it on every boot wears it out
+    // (worn chips take >1s or never finish), so skip it when QE is already set.
+    if((GetStatusRegister() & IS25LP080D_SR_QE) == IS25LP080D_SR_QE)
+    {
+        return QSPIHandle::Result::OK;
+    }
+
     /* Enable write operations */
     s_command.InstructionMode   = QSPI_INSTRUCTION_1_LINE;
     s_command.Instruction       = WRITE_STATUS_REG_CMD;
@@ -792,14 +803,14 @@ QSPIHandle::Result QSPIHandle::Impl::QuadEnable()
     s_command.DataMode    = QSPI_DATA_1_LINE;
 
     if(HAL_QSPI_AutoPolling(
-           &halqspi_, &s_command, &s_config, HAL_QPSI_TIMEOUT_DEFAULT_VALUE)
+           &halqspi_, &s_command, &s_config, kStatusRegWriteTimeoutMs)
        != HAL_OK)
     {
         ERR_SIMPLE(Status::E_HAL_ERROR);
     }
 
     /* Configure automatic polling mode to wait the memory is ready */
-    if(AutopollingMemReady(HAL_QPSI_TIMEOUT_DEFAULT_VALUE)
+    if(AutopollingMemReady(kStatusRegWriteTimeoutMs)
        != QSPIHandle::Result::OK)
     {
         ERR_SIMPLE(Status::E_HAL_ERROR);
@@ -811,6 +822,22 @@ QSPIHandle::Result QSPIHandle::Impl::DefaultStatusRegister()
 {
     QSPI_CommandTypeDef     s_command;
     QSPI_AutoPollingTypeDef s_config;
+
+    // Default status register chunk:
+    // SRWD (Status Register Write Disable) = 0
+    // QE (Quad Enable) = 0
+    // BP3, BP2, BP1, BP0 (Block Protect) = 0
+    // WEL/WIP are volatile bits, so we don't need to set/reset them here
+    //uint8_t reg = 0x00;
+    // We'll set QE here so that the WP/HOLD functions are disbaled.
+    uint8_t reg = 0x40;
+
+    // Non-volatile write; skip it when the register already holds this value
+    // (see QuadEnable()). WIP/WREN are volatile, so ignore them in the compare.
+    if((GetStatusRegister() & ~(IS25LP080D_SR_WIP | IS25LP080D_SR_WREN)) == reg)
+    {
+        return QSPIHandle::Result::OK;
+    }
 
     /* Enable write operations */
     s_command.InstructionMode   = QSPI_INSTRUCTION_1_LINE;
@@ -836,14 +863,6 @@ QSPIHandle::Result QSPIHandle::Impl::DefaultStatusRegister()
         ERR_SIMPLE(Status::E_HAL_ERROR);
     }
 
-    // Default status register chunk:
-    // SRWD (Status Register Write Disable) = 0
-    // QE (Quad Enable) = 0
-    // BP3, BP2, BP1, BP0 (Block Protect) = 0
-    // WEL/WIP are volatile bits, so we don't need to set/reset them here
-    //uint8_t reg = 0x00;
-    // We'll set QE here so that the WP/HOLD functions are disbaled.
-    uint8_t reg = 0x40;
 
     /* Transmission of the data */
     if(HAL_QSPI_Transmit(
@@ -869,14 +888,14 @@ QSPIHandle::Result QSPIHandle::Impl::DefaultStatusRegister()
     s_command.DataMode    = QSPI_DATA_1_LINE;
 
     if(HAL_QSPI_AutoPolling(
-           &halqspi_, &s_command, &s_config, HAL_QPSI_TIMEOUT_DEFAULT_VALUE)
+           &halqspi_, &s_command, &s_config, kStatusRegWriteTimeoutMs)
        != HAL_OK)
     {
         ERR_SIMPLE(Status::E_HAL_ERROR);
     }
 
     /* Configure automatic polling mode to wait the memory is ready */
-    if(AutopollingMemReady(HAL_QPSI_TIMEOUT_DEFAULT_VALUE)
+    if(AutopollingMemReady(kStatusRegWriteTimeoutMs)
        != QSPIHandle::Result::OK)
     {
         ERR_SIMPLE(Status::E_HAL_ERROR);
