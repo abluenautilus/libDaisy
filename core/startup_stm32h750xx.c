@@ -1540,6 +1540,18 @@ void __attribute__((noreturn)) Reset_Handler()
 	asm ("ldr sp, =_estack");
 	#endif
 
+	// STM32H7 rev Y errata (ES0392 2.2.9): "Reading from AXI SRAM may lead to
+	// data read corruption." SystemInit() applies this workaround, but BOOT_APP
+	// builds (APP_TYPE=BOOT_SRAM/BOOT_QSPI) skip SystemInit(), and the Daisy
+	// bootloader's HAL_NVIC_SystemReset() before jump clears the register, so a
+	// BOOT_APP image running from AXI SRAM never gets it. Re-apply it here,
+	// before anything touches SRAM. Raw addresses: DBGMCU_IDCODE = 0x5C001000,
+	// AXI_TARG7_FN_MOD = 0x51008108. Harmless on rev V (guarded off anyway).
+	#ifdef BOOT_APP
+	if (((*(volatile unsigned int *)0x5C001000) & 0xFFFF0000U) < 0x20000000U)
+		*(volatile unsigned int *)0x51008108 = 0x1U;
+	#endif
+
 	void **pSource, **pDest;
 	for (pSource = &_sidata, pDest = &_sdata; pDest != &_edata; pSource++, pDest++)
 		*pDest = *pSource;
